@@ -1,0 +1,233 @@
+function main{
+    Clear-Host 
+
+    
+$menu = "
+                                          
+    # 1) Installer les services AD, DNS et DHCP   
+    # 2) Créer l'arborescence de l'AD           
+    # 3) Créer des utilisateurs                 
+    # 4) Configurer et activer le DHCP          
+    # 5) Désactiver les mots de passe Users     
+    # 6) Afficher l'arborescence de l'AD        
+    # 7) Exporter les users de l'AD en CSV      
+    # 8) Importer les users via csv
+    
+
+    "  
+
+    do{
+        Write-host $menu 
+        $choise= Read-Host "Quel est ton choix"
+        switch ($choise){
+            "1" {installADandDHCPandDNS}
+            "2" {createADStructure}
+            "3" {createNewUser}
+            "4" {configDhcp}
+            "5" {DisableUsersPass}
+            "6" {displayADHierarchy}
+            "7" {exportUsersCSV}
+            "8" {importUsersCSV}
+            Default{ Write-Error "Ce choix n'est pas permis" }
+        }
+    }while($choise -match "[0-8]")
+}
+
+
+function installADandDHCPandDNS {
+   
+    # Installer les services AD
+    Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+    
+    # Installer les services DHCP
+    Install-WindowsFeature -Name DHCP -IncludeManagementTools
+    
+    # Installer les services DNS
+    Install-WindowsFeature -Name DNS -IncludeManagementTools
+
+}
+
+function createADStructure {
+
+    # Demander les informations de base pour créer la racine de l'arborescence
+    $domainName = Read-Host "Nom de domaine racine (ex : mondomaine.com)"
+    $domainNetBIOS = Read-Host "Nom NetBIOS du domaine (ex : MONDOMAINE)"
+    $administratorUsername = Read-Host "Nom d'utilisateur de l'administrateur (ex : admin)"
+    $administratorPassword = Read-Host -AsSecureString "Mot de passe de l'administrateur"
+ 
+    # Créer la racine de l'arborescence
+    $options = @{
+        DomainName = $domainName
+        DomainNetbiosName = $domainNetBIOS
+        ForestMode = "Windows2012R2Forest"
+        DomainMode = "Windows2012R2Domain"
+        InstallDns = $true
+        NoRebootOnCompletion = $true
+        Force = $true
+        Credential = New-Object System.Management.Automation.PSCredential ($administratorUsername, $administratorPassword)
+    }
+    Install-ADDSForest @options
+}
+
+
+function createNewUser {
+    # Demander les informations nécessaires à l'utilisateur
+    $firstname = Read-Host "Prénom : "
+    $lastname = Read-Host "Nom de famille : "
+    $username = Read-Host "Nom d'utilisateur : "
+    $password = Read-Host "Mot de passe : " -AsSecureString
+    $description = Read-Host "Description : "
+    $ou = Read-Host "Unité d'organisation (OU) : "
+
+    # Créer l'utilisateur avec les informations fournies
+    New-ADUser `
+        -Name "$firstname $lastname" `
+        -SamAccountName $username `
+        -AccountPassword $password `
+        -Enabled $true `
+        -Description $description `
+        -Path $ou
+}
+
+
+
+function configDhcp {
+
+    do {
+        try{
+            $fqdn = "$($env:COMPUTERNAME).$((Get-ComputerInfo).CSDomain)"
+            Add-DhcpServerInDC -DnsName $fqdn -IPAddress (Get-NetIPAddress -AddressFamily IPv4).IPAddress[0]
+            Set-ItemProperty -Path registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\ServerManager\Roles\12 -Name ConfigurationState -Value 2
+            do{
+                $numberOfRange = Read-Host "Combien d'étendu souhaitez-vous créer ?"
+                for ($i=0; $i -lt $numberOfRange; $i++) {
+                    $rangeName = Read-Host "Quel est le nom de la range n°$($i + 1)?"
+                    $startRange = Read-Host "Donner l'adresse de début de l'étendue"
+                    $endRange = Read-Host "Donner l'adresse de fin de l'étendue"
+                    $subnetmask = Read-Host "Donner le masque de sous réseau en décimal pointer (exemple : 255.255.255.0)"
+                    $dnsServer = Read-Host "Donner l'adresse du serveur DNS"
+                    $gatewayAddr = Read-Host "Donner l'adresse de la passerelle"
+                    $lessDays = Read-Host "Nombre de jour avant expiration des baux"
+                    $lessHours = Read-Host "Nombre d'heure avant expiration des baux"
+                    $lessMinutes = Read-Host "Nombre de minutes avant expiration des baux"
+                    $lessDuration = New-TimeSpan -Days $lessDays -Hours $lessHours -Minutes $lessMinutes
+        
+                    Add-DhcpServerV4Scope -Name $rangeName -StartRange $startRange -EndRange $endRange -SubnetMask $subnetmask
+                    
+                    Set-DhcpServerV4OptionValue -DnsServer $dnsServer -Router $gatewayAddr
+                    
+                    Set-DhcpServerv4Scope -ScopeId (Get-NetIPAddress -AddressFamily IPv4).IPAddress[0] -LeaseDuration $lessDuration -State Active
+                }
+                Restart-service dhcpserver
+                Write-Host "Configuration du service DHCP réussi" -ForegroundColor Green
+            }while($numberOfRange -notmatch "[0-9]+")
+        } catch {
+            Write-Host "Une erreur est survenu lors de la configuration du service DHCP" -ForegroundColor Red
+        }
+
+        Write-Host "
+            Que voulez-vous faire ?
+            1) Retourner au menu principal
+            2) Quitter
+        "
+        $continue = Read-Host "Votre choix"
+        switch -Regex ($continue) {
+            {$continue -match "[0-2]" -and $continue -eq 1} {
+                main
+                :break
+            }
+            {$continue -match "[0-2]" -and $continue -eq 2} {
+                exit
+            }
+            Default {
+                Write-Host "Saisi non valide"
+            }
+        }
+    }while($continue -eq $true)
+}
+
+
+function DisableUsersPass {
+    do {
+        
+        try {
+            foreach ($user in (Get-ADUser -Filter * -Property * | Where-Object {$_.passwordneverexpires -ne $true})){
+                Set-ADUser -Identity $user.SamAccountName -AccountExpirationDate (Get-Date -Format "MM/dd/yyyy HH:mm:ss")
+                Write-Host "Date d'expiration de $($user.Name) modifier avec succès" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "Une erreur est survenue lors de la désactivation des comptes" -ForegroundColor Red
+        }
+
+        Write-Host "
+            Que voulez-vous faire ?
+            1) Retourner au menu principal
+            2) Quitter
+        "
+        $continue = Read-Host "Votre choix"
+        switch -Regex ($continue) {
+            {$continue -match "[0-2]" -and $continue -eq 1} {
+                main
+                :break
+            }
+            {$continue -match "[0-2]" -and $continue -eq 2} {
+                exit
+            }
+            Default {
+                Write-Host "Saisi non valide"
+            }
+        }
+    }while($continue -eq $true)
+}
+
+function displayADHierarchy {
+    $ous = Get-ADOrganizationalUnit -Filter * -Properties CanonicalName
+    foreach ($ou in $ous) {
+        Write-Host $ou.CanonicalName
+        $subOus = Get-ADOrganizationalUnit -Filter "ParentContainer -eq '$($ou.DistinguishedName)'" -Properties CanonicalName
+        foreach ($subOu in $subOus) {
+            Write-Host "`t$subOu.CanonicalName"
+        }
+        $objects = Get-ADObject -Filter "ObjectClass -eq 'user' -and ObjectCategory -eq 'Person' -and DistinguishedName -like '$($ou.DistinguishedName)/*'" -Properties Name
+        foreach ($object in $objects) {
+            Write-Host "`t$($object.Name)"
+        }
+    }
+}
+
+
+function exportUsersCSV {
+    # Code pour exporter les utilisateurs de l'AD en CSV
+
+    # Importer le module Active Directory
+    Import-Module ActiveDirectory
+
+    # Récupérer les utilisateurs de l'AD
+    $users = Get-ADUser -Filter * -Properties *
+
+    # Exporter les utilisateurs en CSV
+    $users | Export-Csv -Path "C:\Users.csv" -NoTypeInformation
+}
+
+function importUsersCSV {
+    # Code pour importer des utilisateurs dans l'AD depuis un CSV
+    # Import des données du CSV
+$users = Import-Csv -Path "C:\chemin\vers\fichier.csv"
+
+# Parcourir chaque ligne du CSV et créer un nouvel utilisateur dans l'AD
+foreach ($user in $users) {
+    $username = $user.Username
+    $password = $user.Password
+    $ou = $user.OU
+    $firstname = $user.FirstName
+    $lastname = $user.LastName
+    $email = $user.Email
+    
+    # Créer le nouvel utilisateur dans l'AD
+    New-ADUser -Name $username -AccountPassword (ConvertTo-SecureString $password -AsPlainText -Force) `
+    -Enabled $true -Path $ou -GivenName $firstname -Surname $lastname -EmailAddress $email
+}
+
+}
+
+main
